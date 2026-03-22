@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +10,7 @@ from formal_semisup.evaluation.metrics import classification_metrics
 from formal_semisup.methods.common import copy_canonical_artifacts, write_experiment_payload
 from formal_semisup.reporting.visualization import save_embedding_plots
 from formal_semisup.utils.io import ensure_dir, save_json
+from formal_semisup.utils.performance import make_tensor_batch_stream, resolve_amp_dtype, setup_torch_performance
 from formal_semisup.utils.repro import set_global_seed
 
 
@@ -19,52 +18,12 @@ def _torch():
     try:
         import torch
         import torch.nn as nn
-        from torch.utils.data import DataLoader, Dataset
     except Exception as exc:
         raise RuntimeError("torch is required for supervised variants") from exc
-    return torch, nn, DataLoader, Dataset
-
-
-class TimeSeriesDataset:
-    def __init__(self, x_seq: np.ndarray, mask: np.ndarray, y: np.ndarray, indices: np.ndarray):
-        self.x_seq = x_seq.astype(np.float32)
-        self.mask = mask.astype(bool)
-        self.y = y.astype(np.int64)
-        self.indices = indices.astype(np.int64)
-
-    def __len__(self) -> int:
-        return len(self.y)
-
-    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
-        return {
-            "x_seq": self.x_seq[idx],
-            "mask": self.mask[idx],
-            "y": self.y[idx],
-            "index": self.indices[idx],
-        }
-
-
-def _make_loader(dataset: TimeSeriesDataset, batch_size: int, shuffle: bool):
-    torch, _, DataLoader, Dataset = _torch()
-
-    class _WrappedDataset(Dataset):
-        def __len__(self):
-            return len(dataset)
-
-        def __getitem__(self, idx):
-            item = dataset[idx]
-            return {
-                "x_seq": torch.from_numpy(item["x_seq"]),
-                "mask": torch.from_numpy(item["mask"]),
-                "y": torch.tensor(item["y"], dtype=torch.long),
-                "index": torch.tensor(item["index"], dtype=torch.long),
-            }
-
-    return DataLoader(_WrappedDataset(), batch_size=batch_size, shuffle=shuffle)
+    return torch, nn
 
 
 def masked_mean_pool(sequence_embeddings, mask):
-    torch, _, _, _ = _torch()
     valid = (~mask).unsqueeze(-1).float()
     summed = (sequence_embeddings * valid).sum(dim=1)
     denom = valid.sum(dim=1).clamp_min(1.0)
@@ -72,17 +31,54 @@ def masked_mean_pool(sequence_embeddings, mask):
 
 
 def reconstruction_mse(pred, target, mask):
-    torch, _, _, _ = _torch()
     valid = (~mask).unsqueeze(-1).float()
     sq = ((pred - target) ** 2) * valid
     denom = valid.sum().clamp_min(1.0) * pred.shape[-1]
     return sq.sum() / denom
 
 
+def _autocast_context(device: str, performance_cfg: dict[str, Any]):
+    torch, _ = _torch()
+    enabled = bool(performance_cfg.get("mixed_precision", True)) and str(device).startswith("cuda")
+    dtype = resolve_amp_dtype(performance_cfg.get("amp_dtype", "bfloat16"))
+    return torch.autocast(device_type="cuda", dtype=dtype, enabled=enabled)
+
+
+def _make_scaler(device: str, performance_cfg: dict[str, Any]):
+    torch, _ = _torch()
+    enabled = bool(performance_cfg.get("mixed_precision", True)) and str(device).startswith("cuda")
+    try:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+    except Exception:
+        return None
+
+
+def _maybe_compile(model, device: str, performance_cfg: dict[str, Any]):
+    torch, _ = _torch()
+    if not (str(device).startswith("cuda") and bool(performance_cfg.get("torch_compile", False))):
+        return model
+    try:
+        return torch.compile(model, mode=performance_cfg.get("compile_mode", "max-autotune"))
+    except Exception:
+        return model
+
+
+def _to_device(batch, device: str, performance_cfg: dict[str, Any]):
+    current_device = str(batch["x_seq"].device)
+    if current_device.startswith(device):
+        return batch
+    non_blocking = bool(performance_cfg.get("non_blocking_transfer", True))
+    return {
+        "x_seq": batch["x_seq"].to(device=device, dtype=batch["x_seq"].dtype, non_blocking=non_blocking),
+        "mask": batch["mask"].to(device=device, dtype=batch["mask"].dtype, non_blocking=non_blocking),
+        "y": batch["y"].to(device=device, dtype=batch["y"].dtype, non_blocking=non_blocking),
+        "index": batch["index"].to(device=device, dtype=batch["index"].dtype, non_blocking=non_blocking),
+    }
+
+
 class RecurrentClassifier:
     def __init__(self, variant: str, input_dim: int, hidden_size: int, num_layers: int, dropout: float, num_classes: int):
-        torch, nn, _, _ = _torch()
-        self.variant = variant
+        _, nn = _torch()
         rnn_cls = {"supervised_lstm": nn.LSTM, "supervised_rnn": nn.RNN, "supervised_gru": nn.GRU}[variant]
         self.model = nn.Module()
         self.model.encoder = rnn_cls(
@@ -107,7 +103,7 @@ class RecurrentClassifier:
 
 class TransformerClassifier:
     def __init__(self, input_dim: int, d_model: int, nhead: int, num_layers: int, ffn_dim: int, dropout: float, num_classes: int):
-        torch, nn, _, _ = _torch()
+        _, nn = _torch()
         self.model = nn.Module()
         self.model.input_proj = nn.Linear(input_dim, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -134,7 +130,7 @@ class TransformerClassifier:
 
 class ConvAutoencoderClassifier:
     def __init__(self, input_dim: int, latent_channels: int, num_classes: int):
-        torch, nn, _, _ = _torch()
+        _, nn = _torch()
         self.model = nn.Module()
         self.model.encoder = nn.Sequential(
             nn.Conv1d(input_dim, 32, kernel_size=3, padding=1),
@@ -170,29 +166,20 @@ class ConvAutoencoderClassifier:
         self.model.classify = classify
 
 
-def _to_device(batch, device):
-    torch, _, _, _ = _torch()
-    return {
-        "x_seq": batch["x_seq"].to(device=device, dtype=torch.float32),
-        "mask": batch["mask"].to(device=device, dtype=torch.bool),
-        "y": batch["y"].to(device=device, dtype=torch.long),
-        "index": batch["index"].to(device=device, dtype=torch.long),
-    }
-
-
-def _evaluate_classifier(model, loader, device: str, num_classes: int) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
-    torch, _, _, _ = _torch()
+def _evaluate_classifier(model, batch_stream, device: str, num_classes: int, performance_cfg: dict[str, Any]) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
+    torch, _ = _torch()
     model.eval()
     all_logits = []
     all_embeddings = []
     all_targets = []
     with torch.no_grad():
-        for batch in loader:
-            batch = _to_device(batch, device)
-            logits, embeddings = model(batch["x_seq"], batch["mask"])
-            all_logits.append(logits.cpu().numpy())
-            all_embeddings.append(embeddings.cpu().numpy())
-            all_targets.append(batch["y"].cpu().numpy())
+        for batch in batch_stream:
+            batch = _to_device(batch, device, performance_cfg)
+            with _autocast_context(device, performance_cfg):
+                logits, embeddings = model(batch["x_seq"], batch["mask"])
+            all_logits.append(logits.detach().cpu().numpy())
+            all_embeddings.append(embeddings.detach().cpu().numpy())
+            all_targets.append(batch["y"].detach().cpu().numpy())
     logits_np = np.concatenate(all_logits, axis=0)
     embeddings_np = np.concatenate(all_embeddings, axis=0)
     targets_np = np.concatenate(all_targets, axis=0)
@@ -205,16 +192,19 @@ def _run_training_loop(
     *,
     model,
     optimizer,
-    train_loader,
-    val_loader,
+    train_stream,
+    val_stream,
     max_epochs: int,
     patience: int,
     device: str,
     checkpoint_dir: Path,
     variant: str,
+    num_classes: int,
+    performance_cfg: dict[str, Any],
 ) -> dict[str, Any]:
-    torch, nn, _, _ = _torch()
+    torch, nn = _torch()
     criterion = nn.CrossEntropyLoss()
+    scaler = _make_scaler(device, performance_cfg)
     best_metric = -1.0
     best_epoch = -1
     epochs_without_improvement = 0
@@ -234,15 +224,21 @@ def _run_training_loop(
     for epoch in range(start_epoch, max_epochs):
         model.train()
         train_losses = []
-        for batch in train_loader:
-            batch = _to_device(batch, device)
+        for batch in train_stream:
+            batch = _to_device(batch, device, performance_cfg)
             optimizer.zero_grad(set_to_none=True)
-            logits, _ = model(batch["x_seq"], batch["mask"])
-            loss = criterion(logits, batch["y"])
-            loss.backward()
-            optimizer.step()
+            with _autocast_context(device, performance_cfg):
+                logits, _ = model(batch["x_seq"], batch["mask"])
+                loss = criterion(logits, batch["y"])
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             train_losses.append(float(loss.item()))
-        val_metrics, _, _, _ = _evaluate_classifier(model, val_loader, device, num_classes=model.head.out_features)
+        val_metrics, _, _, _ = _evaluate_classifier(model, val_stream, device, num_classes=num_classes, performance_cfg=performance_cfg)
         epoch_record = {
             "epoch": int(epoch),
             "train_loss": float(np.mean(train_losses)) if train_losses else None,
@@ -309,7 +305,21 @@ def _base_resolved_config(config: dict[str, Any], variant: str, device: str) -> 
         "data": config["data"],
         "supervised": config["supervised"],
         "cae": config["cae"],
+        "performance": config.get("performance", {}),
     }
+
+
+def _build_streams(x_split: dict[str, np.ndarray], batch_size: int, shuffle: bool, device: str, performance_cfg: dict[str, Any]):
+    return make_tensor_batch_stream(
+        x=x_split["x_seq"],
+        mask=x_split["mask"],
+        y=x_split["y"],
+        indices=x_split["indices"],
+        batch_size=batch_size,
+        shuffle=shuffle,
+        device=device,
+        performance_cfg=performance_cfg,
+    )
 
 
 def run_supervised_experiment(
@@ -320,8 +330,10 @@ def run_supervised_experiment(
     exp_dir: str | Path,
     device: str,
 ) -> dict[str, Any]:
-    torch, nn, _, _ = _torch()
+    torch, nn = _torch()
     set_global_seed(config["protocol"]["split_seed"])
+    performance_cfg = config.get("performance", {})
+    setup_torch_performance(device, performance_cfg)
     exp_path = Path(exp_dir)
     _copy_protocol(exp_path, exp_path.parent / "canonical")
     supervised_cfg = config["supervised"]
@@ -334,26 +346,16 @@ def run_supervised_experiment(
         key: value[labeled_mask] if isinstance(value, np.ndarray) and len(value) == len(labeled_mask) else value
         for key, value in x_train.items()
     }
-    train_loader = _make_loader(
-        TimeSeriesDataset(train_labeled["x_seq"], train_labeled["mask"], train_labeled["y"], train_labeled["indices"]),
-        batch_size=supervised_cfg["batch_size"],
-        shuffle=True,
-    )
-    val_loader = _make_loader(
-        TimeSeriesDataset(x_val["x_seq"], x_val["mask"], x_val["y"], x_val["indices"]),
-        batch_size=supervised_cfg["batch_size"],
-        shuffle=False,
-    )
-    test_loader = _make_loader(
-        TimeSeriesDataset(x_test["x_seq"], x_test["mask"], x_test["y"], x_test["indices"]),
-        batch_size=supervised_cfg["batch_size"],
-        shuffle=False,
-    )
-    train_eval_loader = _make_loader(
-        TimeSeriesDataset(x_train["x_seq"], x_train["mask"], x_train["y"], x_train["indices"]),
-        batch_size=supervised_cfg["batch_size"],
-        shuffle=False,
-    )
+    train_stream, train_stream_info = _build_streams(train_labeled, supervised_cfg["batch_size"], True, device, performance_cfg)
+    val_stream, val_stream_info = _build_streams(x_val, supervised_cfg["batch_size"], False, device, performance_cfg)
+    test_stream, test_stream_info = _build_streams(x_test, supervised_cfg["batch_size"], False, device, performance_cfg)
+    train_eval_stream, train_eval_stream_info = _build_streams(x_train, supervised_cfg["batch_size"], False, device, performance_cfg)
+    stream_info = {
+        "train_labeled": train_stream_info,
+        "train_full_eval": train_eval_stream_info,
+        "val": val_stream_info,
+        "test": test_stream_info,
+    }
     if variant in {"supervised_lstm", "supervised_rnn", "supervised_gru"}:
         wrapper = RecurrentClassifier(
             variant,
@@ -363,22 +365,24 @@ def run_supervised_experiment(
             dropout=supervised_cfg["dropout"],
             num_classes=config["data"]["num_classes"],
         )
-        model = wrapper.model.to(device)
+        model = _maybe_compile(wrapper.model.to(device), device, performance_cfg)
         optimizer = torch.optim.AdamW(model.parameters(), lr=supervised_cfg["lr"], weight_decay=supervised_cfg["weight_decay"])
         train_summary = _run_training_loop(
             model=model,
             optimizer=optimizer,
-            train_loader=train_loader,
-            val_loader=val_loader,
+            train_stream=train_stream,
+            val_stream=val_stream,
             max_epochs=supervised_cfg["max_epochs"],
             patience=supervised_cfg["patience"],
             device=device,
             checkpoint_dir=exp_path / "checkpoints",
             variant=variant,
+            num_classes=config["data"]["num_classes"],
+            performance_cfg=performance_cfg,
         )
-        train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(model, train_eval_loader, device, config["data"]["num_classes"])
-        val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(model, val_loader, device, config["data"]["num_classes"])
-        test_metrics, _, test_embeddings, test_preds = _evaluate_classifier(model, test_loader, device, config["data"]["num_classes"])
+        train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(model, train_eval_stream, device, config["data"]["num_classes"], performance_cfg)
+        val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(model, val_stream, device, config["data"]["num_classes"], performance_cfg)
+        test_metrics, _, test_embeddings, test_preds = _evaluate_classifier(model, test_stream, device, config["data"]["num_classes"], performance_cfg)
     elif variant == "supervised_transformer":
         wrapper = TransformerClassifier(
             input_dim=dataset.x_seq.shape[-1],
@@ -389,39 +393,33 @@ def run_supervised_experiment(
             dropout=supervised_cfg["transformer_dropout"],
             num_classes=config["data"]["num_classes"],
         )
-        model = wrapper.model.to(device)
+        model = _maybe_compile(wrapper.model.to(device), device, performance_cfg)
         optimizer = torch.optim.AdamW(model.parameters(), lr=supervised_cfg["lr"], weight_decay=supervised_cfg["weight_decay"])
         train_summary = _run_training_loop(
             model=model,
             optimizer=optimizer,
-            train_loader=train_loader,
-            val_loader=val_loader,
+            train_stream=train_stream,
+            val_stream=val_stream,
             max_epochs=supervised_cfg["max_epochs"],
             patience=supervised_cfg["patience"],
             device=device,
             checkpoint_dir=exp_path / "checkpoints",
             variant=variant,
+            num_classes=config["data"]["num_classes"],
+            performance_cfg=performance_cfg,
         )
-        train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(model, train_eval_loader, device, config["data"]["num_classes"])
-        val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(model, val_loader, device, config["data"]["num_classes"])
-        test_metrics, _, test_embeddings, test_preds = _evaluate_classifier(model, test_loader, device, config["data"]["num_classes"])
+        train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(model, train_eval_stream, device, config["data"]["num_classes"], performance_cfg)
+        val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(model, val_stream, device, config["data"]["num_classes"], performance_cfg)
+        test_metrics, _, test_embeddings, test_preds = _evaluate_classifier(model, test_stream, device, config["data"]["num_classes"], performance_cfg)
     elif variant == "cae_pretrain_classifier":
         cae_cfg = config["cae"]
         wrapper = ConvAutoencoderClassifier(input_dim=dataset.x_seq.shape[-1], latent_channels=cae_cfg["latent_channels"], num_classes=config["data"]["num_classes"])
-        model = wrapper.model.to(device)
+        model = _maybe_compile(wrapper.model.to(device), device, performance_cfg)
         checkpoint_dir = exp_path / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         ae_optimizer = torch.optim.AdamW(model.parameters(), lr=cae_cfg["lr"], weight_decay=cae_cfg["weight_decay"])
-        unsup_loader = _make_loader(
-            TimeSeriesDataset(x_train["x_seq"], x_train["mask"], x_train["y"], x_train["indices"]),
-            batch_size=supervised_cfg["batch_size"],
-            shuffle=True,
-        )
-        unsup_val_loader = _make_loader(
-            TimeSeriesDataset(x_val["x_seq"], x_val["mask"], x_val["y"], x_val["indices"]),
-            batch_size=supervised_cfg["batch_size"],
-            shuffle=False,
-        )
+        unsup_loader, unsup_stream_info = _build_streams(x_train, supervised_cfg["batch_size"], True, device, performance_cfg)
+        unsup_val_loader, unsup_val_stream_info = _build_streams(x_val, supervised_cfg["batch_size"], False, device, performance_cfg)
         best_recon = float("inf")
         best_recon_epoch = -1
         pretrain_history = []
@@ -442,24 +440,32 @@ def run_supervised_experiment(
             best_recon = float(state.get("best_recon", best_recon))
             best_recon_epoch = int(state.get("epoch", best_recon_epoch))
             start_epoch = cae_cfg["pretrain_epochs"]
+        pretrain_scaler = _make_scaler(device, performance_cfg)
         for epoch in range(start_epoch, cae_cfg["pretrain_epochs"]):
             model.train()
             losses = []
             for batch in unsup_loader:
-                batch = _to_device(batch, device)
+                batch = _to_device(batch, device, performance_cfg)
                 ae_optimizer.zero_grad(set_to_none=True)
-                recon = model.reconstruct(batch["x_seq"])
-                loss = reconstruction_mse(recon, batch["x_seq"], batch["mask"])
-                loss.backward()
-                ae_optimizer.step()
+                with _autocast_context(device, performance_cfg):
+                    recon = model.reconstruct(batch["x_seq"])
+                    loss = reconstruction_mse(recon, batch["x_seq"], batch["mask"])
+                if pretrain_scaler is not None:
+                    pretrain_scaler.scale(loss).backward()
+                    pretrain_scaler.step(ae_optimizer)
+                    pretrain_scaler.update()
+                else:
+                    loss.backward()
+                    ae_optimizer.step()
                 losses.append(float(loss.item()))
             model.eval()
             with torch.no_grad():
                 val_losses = []
                 for batch in unsup_val_loader:
-                    batch = _to_device(batch, device)
-                    recon = model.reconstruct(batch["x_seq"])
-                    val_losses.append(float(reconstruction_mse(recon, batch["x_seq"], batch["mask"]).item()))
+                    batch = _to_device(batch, device, performance_cfg)
+                    with _autocast_context(device, performance_cfg):
+                        recon = model.reconstruct(batch["x_seq"])
+                        val_losses.append(float(reconstruction_mse(recon, batch["x_seq"], batch["mask"]).item()))
             val_recon = float(np.mean(val_losses)) if val_losses else float("inf")
             pretrain_history.append({"epoch": epoch, "train_recon_loss": float(np.mean(losses)), "val_reconstruction_loss": val_recon})
             if val_recon < best_recon:
@@ -491,22 +497,24 @@ def run_supervised_experiment(
                 logits, pooled, _ = self.cae_model.classify(x_seq, mask)
                 return logits, pooled
 
-        classifier_model = _CAEClassifier(model).to(device)
+        classifier_model = _maybe_compile(_CAEClassifier(model).to(device), device, performance_cfg)
         optimizer = torch.optim.AdamW(classifier_model.parameters(), lr=cae_cfg["lr"], weight_decay=cae_cfg["weight_decay"])
         finetune_summary = _run_training_loop(
             model=classifier_model,
             optimizer=optimizer,
-            train_loader=train_loader,
-            val_loader=val_loader,
+            train_stream=train_stream,
+            val_stream=val_stream,
             max_epochs=cae_cfg["finetune_epochs"],
             patience=cae_cfg["patience"],
             device=device,
             checkpoint_dir=checkpoint_dir,
             variant=variant,
+            num_classes=config["data"]["num_classes"],
+            performance_cfg=performance_cfg,
         )
-        train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(classifier_model, train_eval_loader, device, config["data"]["num_classes"])
-        val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(classifier_model, val_loader, device, config["data"]["num_classes"])
-        test_metrics, _, test_embeddings, test_preds = _evaluate_classifier(classifier_model, test_loader, device, config["data"]["num_classes"])
+        train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(classifier_model, train_eval_stream, device, config["data"]["num_classes"], performance_cfg)
+        val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(classifier_model, val_stream, device, config["data"]["num_classes"], performance_cfg)
+        test_metrics, _, test_embeddings, test_preds = _evaluate_classifier(classifier_model, test_stream, device, config["data"]["num_classes"], performance_cfg)
         train_summary = {
             "stage1_pretrain": {
                 "best_epoch": best_recon_epoch,
@@ -514,12 +522,15 @@ def run_supervised_experiment(
                 "history": pretrain_history,
                 "best_checkpoint": str(best_ae_path),
                 "last_checkpoint": str(last_ae_path),
+                "data_stream": {"train": unsup_stream_info, "val": unsup_val_stream_info},
             },
             "stage2_finetune": finetune_summary,
         }
     else:
         raise ValueError(f"unknown supervised variant: {variant}")
 
+    if "data_stream" not in train_summary:
+        train_summary["data_stream"] = stream_info
     plot_paths = save_embedding_plots(exp_path, test_embeddings, x_test["y"])
     eval_summary = {
         "variant": variant,

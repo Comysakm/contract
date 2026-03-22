@@ -30,6 +30,19 @@ constraints:
   must_link_multiplier: 4
   cannot_link_multiplier: 4
 
+performance:
+  gpu_preload_policy: auto
+  gpu_preload_max_gb: 32.0
+  pin_memory: true
+  non_blocking_transfer: true
+  mixed_precision: true
+  amp_dtype: bfloat16
+  allow_tf32: true
+  torch_compile: false
+  compile_mode: max-autotune
+  prefer_faiss: true
+  faiss_use_gpu: auto
+
 supervised:
   batch_size: 128
   max_epochs: 100

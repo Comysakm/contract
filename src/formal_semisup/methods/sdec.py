@@ -11,6 +11,7 @@ from formal_semisup.evaluation.metrics import clustering_with_semantic_mapping
 from formal_semisup.methods.common import copy_canonical_artifacts, write_experiment_payload
 from formal_semisup.reporting.visualization import save_embedding_plots
 from formal_semisup.utils.io import ensure_dir, save_json
+from formal_semisup.utils.performance import make_flat_tensor_batch_stream, resolve_amp_dtype, setup_torch_performance
 from formal_semisup.utils.repro import set_global_seed
 
 
@@ -19,10 +20,9 @@ def _torch():
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
-        from torch.utils.data import DataLoader, TensorDataset
     except Exception as exc:
         raise RuntimeError("torch is required for SDEC") from exc
-    return torch, nn, F, DataLoader, TensorDataset
+    return torch, nn, F
 
 
 class StackedAutoencoder:
@@ -68,7 +68,7 @@ def _target_distribution(q):
 
 
 def _pairwise_loss(z, ml_pairs: np.ndarray, cl_pairs: np.ndarray):
-    torch, _, _, _, _ = _torch()
+    torch, _, _ = _torch()
     total = torch.tensor(0.0, device=z.device)
     if len(ml_pairs):
         ml_i = torch.as_tensor(ml_pairs[:, 0], dtype=torch.long, device=z.device)
@@ -81,16 +81,43 @@ def _pairwise_loss(z, ml_pairs: np.ndarray, cl_pairs: np.ndarray):
     return total
 
 
-def _evaluate_sdec(model, x: np.ndarray, y: np.ndarray, device: str, num_classes: int):
-    torch, _, _, _, _ = _torch()
+def _evaluate_sdec(model, x: np.ndarray, y: np.ndarray, device: str, num_classes: int, performance_cfg: dict[str, Any]):
+    torch, _, _ = _torch()
     model.eval()
     with torch.no_grad():
         x_tensor = torch.as_tensor(x, dtype=torch.float32, device=device)
-        z = model.encode(x_tensor)
-        q = model.soft_assign(z)
+        with _autocast_context(device, performance_cfg):
+            z = model.encode(x_tensor)
+            q = model.soft_assign(z)
         assignments = torch.argmax(q, dim=1).cpu().numpy().astype(np.int64)
         embeddings = z.cpu().numpy().astype(np.float32)
     return clustering_with_semantic_mapping(y, assignments, num_classes=num_classes, features=embeddings), embeddings, assignments
+
+
+def _autocast_context(device: str, performance_cfg: dict[str, Any]):
+    torch, _, _ = _torch()
+    enabled = bool(performance_cfg.get("mixed_precision", True)) and str(device).startswith("cuda")
+    dtype = resolve_amp_dtype(performance_cfg.get("amp_dtype", "bfloat16"))
+    return torch.autocast(device_type="cuda", dtype=dtype, enabled=enabled)
+
+
+def _make_scaler(device: str, performance_cfg: dict[str, Any]):
+    torch, _, _ = _torch()
+    enabled = bool(performance_cfg.get("mixed_precision", True)) and str(device).startswith("cuda")
+    try:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+    except Exception:
+        return None
+
+
+def _maybe_compile(model, device: str, performance_cfg: dict[str, Any]):
+    torch, _, _ = _torch()
+    if not (str(device).startswith("cuda") and bool(performance_cfg.get("torch_compile", False))):
+        return model
+    try:
+        return torch.compile(model, mode=performance_cfg.get("compile_mode", "max-autotune"))
+    except Exception:
+        return model
 
 
 def run_sdec(
@@ -100,8 +127,10 @@ def run_sdec(
     exp_dir: str | Path,
     device: str,
 ) -> dict[str, Any]:
-    torch, nn, F, DataLoader, TensorDataset = _torch()
+    torch, nn, F = _torch()
     set_global_seed(config["protocol"]["split_seed"])
+    performance_cfg = config.get("performance", {})
+    setup_torch_performance(device, performance_cfg)
     exp_path = Path(exp_dir)
     ensure_dir(exp_path / "checkpoints")
     ensure_dir(exp_path / "logs")
@@ -111,14 +140,20 @@ def run_sdec(
     test = dataset.split_arrays("test")
     cfg = config["sdec"]
     model_wrapper = StackedAutoencoder(cfg["input_dim"], cfg["hidden_dims"], cfg["latent_dim"])
-    model = model_wrapper.model.to(device)
+    model = _maybe_compile(model_wrapper.model.to(device), device, performance_cfg)
     x_train = train["x_flat"].astype(np.float32)
     x_val = val["x_flat"].astype(np.float32)
     x_test = test["x_flat"].astype(np.float32)
-    tensor_dataset = TensorDataset(torch.as_tensor(x_train, dtype=torch.float32))
-    loader = DataLoader(tensor_dataset, batch_size=cfg["batch_size"], shuffle=True)
+    loader, train_stream_info = make_flat_tensor_batch_stream(
+        x=x_train,
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        device=device,
+        performance_cfg=performance_cfg,
+    )
     val_tensor = torch.as_tensor(x_val, dtype=torch.float32, device=device)
     pretrain_optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    pretrain_scaler = _make_scaler(device, performance_cfg)
     best_pretrain = float("inf")
     best_pretrain_epoch = -1
     pretrain_history = []
@@ -142,17 +177,26 @@ def run_sdec(
     for epoch in range(pretrain_start_epoch, cfg["pretrain_epochs"]):
         model.train()
         losses = []
-        for (batch_x,) in loader:
-            batch_x = batch_x.to(device)
+        for batch in loader:
+            batch_x = batch["x"]
+            if str(batch_x.device) != device:
+                batch_x = batch_x.to(device=device, non_blocking=True)
             pretrain_optimizer.zero_grad(set_to_none=True)
-            recon = model.reconstruct(batch_x)
-            loss = F.mse_loss(recon, batch_x)
-            loss.backward()
-            pretrain_optimizer.step()
+            with _autocast_context(device, performance_cfg):
+                recon = model.reconstruct(batch_x)
+                loss = F.mse_loss(recon, batch_x)
+            if pretrain_scaler is not None:
+                pretrain_scaler.scale(loss).backward()
+                pretrain_scaler.step(pretrain_optimizer)
+                pretrain_scaler.update()
+            else:
+                loss.backward()
+                pretrain_optimizer.step()
             losses.append(float(loss.item()))
         model.eval()
         with torch.no_grad():
-            val_recon = float(F.mse_loss(model.reconstruct(val_tensor), val_tensor).item())
+            with _autocast_context(device, performance_cfg):
+                val_recon = float(F.mse_loss(model.reconstruct(val_tensor), val_tensor).item())
         pretrain_history.append({"epoch": epoch, "train_reconstruction_loss": float(np.mean(losses)), "val_reconstruction_loss": val_recon})
         if val_recon < best_pretrain:
             best_pretrain = val_recon
@@ -196,6 +240,7 @@ def run_sdec(
         dtype=np.int64,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    scaler = _make_scaler(device, performance_cfg)
     best_metric = -1.0
     best_epoch = -1
     wait = 0
@@ -224,15 +269,21 @@ def run_sdec(
     for epoch in range(start_epoch, cfg["train_epochs"]):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        z = model.encode(x_train_tensor)
-        q = model.soft_assign(z)
-        p = _target_distribution(q.detach())
-        kl = torch.mean(torch.sum(p * torch.log((p + 1e-8) / (q + 1e-8)), dim=1))
-        pairwise = _pairwise_loss(z, ml_pairs, cl_pairs)
-        loss = kl + cfg["lambda_pairwise"] * pairwise
-        loss.backward()
-        optimizer.step()
-        val_eval, _, _ = _evaluate_sdec(model, x_val, val["y"], device, config["data"]["num_classes"])
+        with _autocast_context(device, performance_cfg):
+            z = model.encode(x_train_tensor)
+            q = model.soft_assign(z)
+            p = _target_distribution(q.detach())
+            kl = torch.mean(torch.sum(p * torch.log((p + 1e-8) / (q + 1e-8)), dim=1))
+            pairwise = _pairwise_loss(z, ml_pairs, cl_pairs)
+            loss = kl + cfg["lambda_pairwise"] * pairwise
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        val_eval, _, _ = _evaluate_sdec(model, x_val, val["y"], device, config["data"]["num_classes"], performance_cfg)
         record = {
             "epoch": epoch,
             "train_loss": float(loss.item()),
@@ -276,9 +327,9 @@ def run_sdec(
     if best_path.exists():
         state = torch.load(best_path, map_location=device)
         model.load_state_dict(state["model_state"], strict=False)
-    train_eval, train_embeddings, train_assignments = _evaluate_sdec(model, x_train, train["y"], device, config["data"]["num_classes"])
-    val_eval, val_embeddings, val_assignments = _evaluate_sdec(model, x_val, val["y"], device, config["data"]["num_classes"])
-    test_eval, test_embeddings, test_assignments = _evaluate_sdec(model, x_test, test["y"], device, config["data"]["num_classes"])
+    train_eval, train_embeddings, train_assignments = _evaluate_sdec(model, x_train, train["y"], device, config["data"]["num_classes"], performance_cfg)
+    val_eval, val_embeddings, val_assignments = _evaluate_sdec(model, x_val, val["y"], device, config["data"]["num_classes"], performance_cfg)
+    test_eval, test_embeddings, test_assignments = _evaluate_sdec(model, x_test, test["y"], device, config["data"]["num_classes"], performance_cfg)
     plot_paths = save_embedding_plots(exp_path, test_embeddings, test["y"])
     np.save(exp_path / "checkpoints" / "test_embeddings.npy", test_embeddings)
     save_json(exp_path / "mapping.json", {"val": val_eval["mapping"], "test": test_eval["mapping"]})
@@ -299,6 +350,7 @@ def run_sdec(
             "history": pretrain_history,
             "best_checkpoint": str(best_pretrain_path),
             "last_checkpoint": str(last_pretrain_path),
+            "data_stream": train_stream_info,
         },
         "stage2_clustering": {
             "best_epoch": int(best_epoch),
@@ -307,11 +359,12 @@ def run_sdec(
             "best_checkpoint": str(best_path),
             "last_checkpoint": str(last_path),
             "pairwise_counts": {"must_link": int(len(ml_pairs)), "cannot_link": int(len(cl_pairs))},
+            "performance": performance_cfg,
         },
     }
     write_experiment_payload(
         exp_path,
-        resolved_config={"variant": "sdec", "sdec": cfg, "protocol": config["protocol"], "data": config["data"]},
+        resolved_config={"variant": "sdec", "sdec": cfg, "protocol": config["protocol"], "data": config["data"], "performance": performance_cfg},
         train_summary=train_summary,
         eval_summary=eval_summary,
     )
