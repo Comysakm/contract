@@ -1,0 +1,89 @@
+project:
+  name: formal_semisup_pack
+  default_pack_id: formal_v1
+  default_server_name: auto
+
+data:
+  x_path: /home/mw/input/TimeSen2Crop1854/trainx9.npy
+  y_path: /home/mw/input/TimeSen2Crop1854/trainy9.npy
+  seq_len: 38
+  spectral_dim: 9
+  num_classes: 16
+  clean_cloud_threshold: 1.0
+  min_valid_steps: 0
+  full_data_protocol: true
+  unfiltered_protocol: true
+
+protocol:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  split_seed: 42
+  label_fraction: 0.01
+  strict_label_training_only: 1
+  subset_seed: 42
+  constraint_seed: 42
+  clip_min: -3.0
+  clip_max: 3.0
+
+constraints:
+  must_link_multiplier: 4
+  cannot_link_multiplier: 4
+
+supervised:
+  batch_size: 128
+  max_epochs: 100
+  patience: 15
+  lr: 0.001
+  weight_decay: 0.0001
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  transformer_dropout: 0.1
+  transformer_heads: 4
+  transformer_ffn: 256
+
+cae:
+  pretrain_epochs: 50
+  finetune_epochs: 100
+  patience: 15
+  lr: 0.001
+  weight_decay: 0.0001
+  latent_channels: 64
+
+cop_kmeans:
+  n_clusters: 16
+  n_init: 10
+  max_iter: 100
+
+semi_supervised_spectral:
+  n_clusters: 16
+  k_neighbors: 30
+  kmeans_n_init: 10
+  random_seed: 42
+
+sdec:
+  input_dim: 380
+  latent_dim: 32
+  hidden_dims: [256, 128]
+  batch_size: 256
+  pretrain_epochs: 50
+  train_epochs: 100
+  patience: 20
+  lr: 0.001
+  weight_decay: 0.0001
+  update_interval: 256
+  lambda_pairwise: 0.1
+  n_clusters: 16
+
+variants:
+  table1:
+    - supervised_lstm
+    - supervised_rnn
+    - supervised_gru
+    - supervised_transformer
+    - cae_pretrain_classifier
+  table2:
+    - cop_kmeans
+    - semi_supervised_spectral
+    - sdec
