@@ -31,7 +31,9 @@ def _want_faiss_gpu(performance_cfg: dict[str, Any]) -> bool:
         return True
     if mode == "false" or mode == "never":
         return False
-    return _torch_cuda_available()
+    # "auto" defaults to CPU FAISS because GPU IndexFlatL2 can abort the process
+    # in large exact-search workloads before Python gets a chance to recover.
+    return False
 
 
 @dataclass
