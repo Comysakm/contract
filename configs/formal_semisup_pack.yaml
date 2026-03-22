@@ -42,7 +42,8 @@ performance:
   compile_mode: max-autotune
   prefer_faiss: true
   faiss_use_gpu: auto
-  faiss_query_chunk: 8192
+  faiss_query_chunk: 2048
+  faiss_gpu_fallback_to_cpu: true
 
 supervised:
   batch_size: 128

@@ -43,23 +43,32 @@ class NeighborSearchIndex:
     train_size: int
     dim: int
     query_chunk: int
+    cpu_fallback: Any | None
+    allow_gpu_fallback: bool
 
     def kneighbors(self, x_query: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         x_query = np.ascontiguousarray(x_query.astype(np.float32))
         if self.backend.startswith("faiss"):
-            if self.query_chunk and x_query.shape[0] > self.query_chunk:
-                all_dist = []
-                all_idx = []
-                for start in range(0, x_query.shape[0], self.query_chunk):
-                    chunk = x_query[start : start + self.query_chunk]
-                    distances_sq, neighbors = self.index.search(chunk, self.n_neighbors)
+            try:
+                if self.query_chunk and x_query.shape[0] > self.query_chunk:
+                    all_dist = []
+                    all_idx = []
+                    for start in range(0, x_query.shape[0], self.query_chunk):
+                        chunk = x_query[start : start + self.query_chunk]
+                        distances_sq, neighbors = self.index.search(chunk, self.n_neighbors)
+                        distances = np.sqrt(np.maximum(distances_sq, 0.0)).astype(np.float32)
+                        all_dist.append(distances)
+                        all_idx.append(neighbors.astype(np.int64))
+                    return np.vstack(all_dist), np.vstack(all_idx)
+                distances_sq, neighbors = self.index.search(x_query, self.n_neighbors)
+                distances = np.sqrt(np.maximum(distances_sq, 0.0)).astype(np.float32)
+                return distances.astype(np.float32), neighbors.astype(np.int64)
+            except Exception:
+                if self.cpu_fallback is not None and self.allow_gpu_fallback:
+                    distances_sq, neighbors = self.cpu_fallback.search(x_query, self.n_neighbors)
                     distances = np.sqrt(np.maximum(distances_sq, 0.0)).astype(np.float32)
-                    all_dist.append(distances)
-                    all_idx.append(neighbors.astype(np.int64))
-                return np.vstack(all_dist), np.vstack(all_idx)
-            distances_sq, neighbors = self.index.search(x_query, self.n_neighbors)
-            distances = np.sqrt(np.maximum(distances_sq, 0.0)).astype(np.float32)
-            return distances.astype(np.float32), neighbors.astype(np.int64)
+                    return distances.astype(np.float32), neighbors.astype(np.int64)
+                raise
         distances, neighbors = self.index.kneighbors(x_query)
         return distances.astype(np.float32), neighbors.astype(np.int64)
 
@@ -70,6 +79,9 @@ class NeighborSearchIndex:
             "train_size": int(self.train_size),
             "dim": int(self.dim),
             "n_neighbors": int(self.n_neighbors),
+            "query_chunk": int(self.query_chunk),
+            "cpu_fallback": self.cpu_fallback is not None,
+            "allow_gpu_fallback": bool(self.allow_gpu_fallback),
         }
 
 
@@ -78,14 +90,15 @@ def build_neighbor_index(x_train: np.ndarray, n_neighbors: int, performance_cfg:
     prefer_faiss = bool(performance_cfg.get("prefer_faiss", True))
     faiss = _try_import_faiss() if prefer_faiss else None
     query_chunk = int(performance_cfg.get("faiss_query_chunk", 0) or 0)
+    allow_gpu_fallback = bool(performance_cfg.get("faiss_gpu_fallback_to_cpu", True))
     if faiss is not None:
         use_gpu = _want_faiss_gpu(performance_cfg) and hasattr(faiss, "StandardGpuResources")
         try:
             if use_gpu:
                 res = faiss.StandardGpuResources()
                 cpu_index = faiss.IndexFlatL2(x_train.shape[1])
+                cpu_index.add(x_train)
                 gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-                gpu_index.add(x_train)
                 return NeighborSearchIndex(
                     backend="faiss-gpu",
                     index=gpu_index,
@@ -94,6 +107,8 @@ def build_neighbor_index(x_train: np.ndarray, n_neighbors: int, performance_cfg:
                     train_size=len(x_train),
                     dim=x_train.shape[1],
                     query_chunk=query_chunk,
+                    cpu_fallback=cpu_index,
+                    allow_gpu_fallback=allow_gpu_fallback,
                 )
             cpu_index = faiss.IndexFlatL2(x_train.shape[1])
             cpu_index.add(x_train)
@@ -105,6 +120,8 @@ def build_neighbor_index(x_train: np.ndarray, n_neighbors: int, performance_cfg:
                 train_size=len(x_train),
                 dim=x_train.shape[1],
                 query_chunk=query_chunk,
+                cpu_fallback=None,
+                allow_gpu_fallback=False,
             )
         except Exception:
             pass
@@ -118,4 +135,6 @@ def build_neighbor_index(x_train: np.ndarray, n_neighbors: int, performance_cfg:
         train_size=len(x_train),
         dim=x_train.shape[1],
         query_chunk=0,
+        cpu_fallback=None,
+        allow_gpu_fallback=False,
     )
