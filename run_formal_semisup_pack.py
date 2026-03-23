@@ -79,7 +79,7 @@ def main() -> None:
             elif variant == "cop_kmeans":
                 run_cop_kmeans(dataset=dataset, config=config, exp_dir=exp_dir)
             elif variant == "semi_supervised_spectral":
-                run_semi_supervised_spectral(dataset=dataset, config=config, exp_dir=exp_dir)
+                run_semi_supervised_spectral(dataset=dataset, config=config, exp_dir=exp_dir, device=device)
             elif variant == "sdec":
                 run_sdec(dataset=dataset, config=config, exp_dir=exp_dir, device=device)
             else:
