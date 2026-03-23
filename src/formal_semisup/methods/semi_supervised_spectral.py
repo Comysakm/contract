@@ -15,6 +15,7 @@ from formal_semisup.methods.common import copy_canonical_artifacts, select_best_
 from formal_semisup.utils.faiss_utils import NeighborSearchIndex, build_neighbor_index
 from formal_semisup.utils.io import ensure_dir, save_json
 from formal_semisup.utils.repro import set_global_seed
+from formal_semisup.utils.runtime import utc_now_iso
 
 
 def _torch():
@@ -186,6 +187,21 @@ def _extrapolate_embedding(x_new: np.ndarray, train_embedding: np.ndarray, neigh
     return np.einsum("nk,nkd->nd", normalized, gathered, optimize=True).astype(np.float32)
 
 
+def _append_stage_history(exp_path: Path, payload: dict[str, Any]) -> None:
+    logs_dir = ensure_dir(exp_path / "logs")
+    history_path = logs_dir / "stage_history.jsonl"
+    with history_path.open("a", encoding="utf-8") as handle:
+        import json
+
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _write_stage_progress(exp_path: Path, stage: str, **details: Any) -> None:
+    payload = {"timestamp": utc_now_iso(), "stage": stage, **details}
+    save_json(exp_path / "logs" / "stage_progress.json", payload)
+    _append_stage_history(exp_path, payload)
+
+
 def run_semi_supervised_spectral(
     *,
     dataset: CanonicalDataset,
@@ -203,9 +219,36 @@ def run_semi_supervised_spectral(
     test = dataset.split_arrays("test")
     cfg = config["semi_supervised_spectral"]
     performance_cfg = config.get("performance", {})
+    save_json(
+        exp_path / "resolved_config.json",
+        {
+            "variant": "semi_supervised_spectral",
+            "semi_supervised_spectral": cfg,
+            "protocol": config["protocol"],
+            "data": config["data"],
+            "performance": performance_cfg,
+            "device": device,
+        },
+    )
+    _write_stage_progress(exp_path, "started", device=device)
     affinity, sigma, neighbor_index, neighbor_summary = _build_knn_affinity(train["x_flat"], cfg["k_neighbors"], performance_cfg)
+    _write_stage_progress(exp_path, "knn_affinity_built", sigma=sigma, neighbor_backend=neighbor_summary)
     affinity, inject_summary = _inject_constraints(affinity, train["indices"], dataset.pairwise_constraints)
     graph_components, _ = connected_components(affinity)
+    save_json(
+        exp_path / "graph_summary.json",
+        {
+            "nodes": int(affinity.shape[0]),
+            "edges": int(affinity.nnz),
+            "connected_components": int(graph_components),
+            "sigma": sigma,
+            "neighbor_backend": neighbor_summary,
+            "spectral_backend": _resolve_backend(device, performance_cfg),
+            "constraint_injection": inject_summary,
+            "status": "graph_ready",
+        },
+    )
+    _write_stage_progress(exp_path, "constraints_injected", connected_components=int(graph_components), edges=int(affinity.nnz))
     spectral_backend = _resolve_backend(device, performance_cfg)
     if spectral_backend == "gpu":
         train_embedding = _gpu_spectral_embedding(
@@ -239,6 +282,14 @@ def run_semi_supervised_spectral(
                 }
             )
         clustering_backend = "sklearn-cpu"
+    np.save(exp_path / "checkpoints" / "train_embedding.npy", train_embedding)
+    _write_stage_progress(
+        exp_path,
+        "spectral_embedding_ready",
+        spectral_backend=spectral_backend,
+        clustering_backend=clustering_backend,
+        embedding_shape=list(train_embedding.shape),
+    )
 
     candidates = []
     for candidate in kmeans_candidates:
@@ -257,7 +308,19 @@ def run_semi_supervised_spectral(
                 "val_ARI": float(val_eval["clustering_metrics"]["ARI"]),
             }
         )
+        _append_stage_history(
+            exp_path,
+            {
+                "timestamp": utc_now_iso(),
+                "stage": "kmeans_candidate_evaluated",
+                "init_id": int(candidate["init_id"]),
+                "val_mapped_MA": float(val_eval["mapped_semantic_metrics"]["MA"]),
+                "val_NMI": float(val_eval["clustering_metrics"]["NMI"]),
+                "val_ARI": float(val_eval["clustering_metrics"]["ARI"]),
+            },
+        )
     best = select_best_candidate(candidates, "val_mapped_MA", ["val_NMI", "val_ARI"])
+    _write_stage_progress(exp_path, "best_candidate_selected", best_init_id=int(best["init_id"]))
     centers = best["centers"]
     train_assignments = best["train_assignments"]
     val_embedding = best["val_embedding"]
@@ -267,7 +330,6 @@ def run_semi_supervised_spectral(
     train_eval = clustering_with_semantic_mapping(train["y"], train_assignments, num_classes=config["data"]["num_classes"], features=train_embedding)
     val_eval = clustering_with_semantic_mapping(val["y"], val_assignments, num_classes=config["data"]["num_classes"], features=val_embedding)
     test_eval = clustering_with_semantic_mapping(test["y"], test_assignments, num_classes=config["data"]["num_classes"], features=test_embedding)
-    np.save(exp_path / "checkpoints" / "train_embedding.npy", train_embedding)
     np.save(exp_path / "checkpoints" / "cluster_centers.npy", centers)
     save_json(
         exp_path / "graph_summary.json",
@@ -318,4 +380,5 @@ def run_semi_supervised_spectral(
         train_summary=train_summary,
         eval_summary=eval_summary,
     )
+    _write_stage_progress(exp_path, "completed")
     return eval_summary
