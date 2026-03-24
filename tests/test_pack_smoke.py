@@ -61,6 +61,53 @@ class PackSmokeTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_pack_runner_rebuilds_corrupted_canonical(self):
+        temp_dir = Path(tempfile.mkdtemp(prefix="formal_semisup_corrupt_"))
+        try:
+            x_path = temp_dir / "trainx9.npy"
+            y_path = temp_dir / "trainy9.npy"
+            rng = np.random.default_rng(7)
+            samples = []
+            labels = []
+            for class_id, center in enumerate([0.0, 3.0, 6.0]):
+                for _ in range(160):
+                    length = int(rng.integers(16, 39))
+                    sample = np.zeros((length, 11), dtype=np.float32)
+                    sample[:, :9] = rng.normal(loc=center, scale=0.4, size=(length, 9)).astype(np.float32)
+                    sample[:, 9] = 0.0
+                    sample[:, 10] = np.linspace(1, 365, num=length, dtype=np.float32)
+                    samples.append(sample)
+                    labels.append(class_id)
+            np.save(x_path, np.array(samples, dtype=object), allow_pickle=True)
+            np.save(y_path, np.asarray(labels, dtype=np.int64))
+            pack_id = "smoke_corrupt_pack"
+            cmd = [
+                sys.executable,
+                "run_formal_semisup_pack.py",
+                "--pack-id",
+                pack_id,
+                "--variants",
+                "cop_kmeans",
+                "--data-x",
+                str(x_path),
+                "--data-y",
+                str(y_path),
+            ]
+            subprocess.run(cmd, cwd=ROOT, check=True)
+            server_root = ROOT / "runs" / "formal_semisup_pack" / pack_id
+            server_dirs = [path for path in server_root.iterdir() if path.is_dir()]
+            self.assertTrue(server_dirs)
+            pack_root = server_dirs[0]
+            canonical_npz = pack_root / "canonical" / "canonical_data.npz"
+            canonical_npz.write_bytes(b"corrupt")
+            subprocess.run(cmd, cwd=ROOT, check=True)
+            self.assertTrue((pack_root / "summary.csv").exists())
+            repaired = np.load(canonical_npz, allow_pickle=True)
+            self.assertIn("x_spec", repaired.files)
+            repaired.close()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

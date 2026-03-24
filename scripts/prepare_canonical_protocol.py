@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -69,14 +70,22 @@ def prepare_canonical_protocol(config_path: str | Path, output_dir: str | Path, 
         invalid_samples=invalid_samples,
     )
     npz_path = canonical_dir / "canonical_data.npz"
-    np.savez_compressed(
-        npz_path,
-        x_spec=stacked["x_spec"],
-        x_doy=stacked["x_doy"],
-        x_seq=stacked["x_seq"],
-        mask=stacked["mask"],
-        y=valid_y,
-    )
+    temp_npz = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=canonical_dir, suffix=".npz", delete=False) as handle:
+            temp_npz = Path(handle.name)
+        np.savez_compressed(
+            temp_npz,
+            x_spec=stacked["x_spec"],
+            x_doy=stacked["x_doy"],
+            x_seq=stacked["x_seq"],
+            mask=stacked["mask"],
+            y=valid_y,
+        )
+        temp_npz.replace(npz_path)
+    finally:
+        if temp_npz is not None and temp_npz.exists():
+            temp_npz.unlink()
     save_json(
         canonical_dir / "canonical_manifest.json",
         {

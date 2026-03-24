@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -40,6 +41,29 @@ def resolve_variants(config: dict, variants_arg: str | None) -> list[str]:
     return list(config["variants"]["table1"]) + list(config["variants"]["table2"])
 
 
+def _clear_directory(path: Path) -> None:
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def ensure_canonical_dataset(config_path: str, canonical_dir: Path, x_path: str, y_path: str):
+    manifest_path = canonical_dir / "canonical_manifest.json"
+    should_prepare = not manifest_path.exists()
+    if should_prepare:
+        print(f"[canonical] preparing canonical artifacts at {canonical_dir}", flush=True)
+        prepare_canonical_protocol(config_path, canonical_dir, x_path, y_path)
+    try:
+        return load_canonical_dataset(canonical_dir)
+    except Exception as exc:
+        print(f"[canonical] existing artifacts are invalid, rebuilding: {exc}", flush=True)
+        _clear_directory(canonical_dir)
+        prepare_canonical_protocol(config_path, canonical_dir, x_path, y_path)
+        return load_canonical_dataset(canonical_dir)
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -50,9 +74,7 @@ def main() -> None:
     canonical_dir = ensure_dir(pack_root / "canonical")
     x_path = args.data_x or config["data"]["x_path"]
     y_path = args.data_y or config["data"]["y_path"]
-    if not (canonical_dir / "canonical_manifest.json").exists():
-        prepare_canonical_protocol(args.config, canonical_dir, x_path, y_path)
-    dataset = load_canonical_dataset(canonical_dir)
+    dataset = ensure_canonical_dataset(args.config, canonical_dir, x_path, y_path)
     variants = resolve_variants(config, args.variants)
     completed = []
     failed = []
