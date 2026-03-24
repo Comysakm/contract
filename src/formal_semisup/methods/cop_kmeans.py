@@ -28,6 +28,57 @@ def _build_constraint_maps(pairwise_constraints: dict[str, Any]) -> tuple[dict[i
     return must, cannot
 
 
+def _build_constraint_components(
+    train_indices: np.ndarray,
+    must: dict[int, set[int]],
+    cannot: dict[int, set[int]],
+) -> tuple[list[list[int]], dict[int, set[int]], set[int]]:
+    train_set = {int(idx) for idx in train_indices.tolist()}
+    constrained_nodes = set()
+    for node, neighbors in must.items():
+        if node in train_set:
+            constrained_nodes.add(int(node))
+        constrained_nodes.update(int(neighbor) for neighbor in neighbors if int(neighbor) in train_set)
+    for node, neighbors in cannot.items():
+        if node in train_set:
+            constrained_nodes.add(int(node))
+        constrained_nodes.update(int(neighbor) for neighbor in neighbors if int(neighbor) in train_set)
+    components: list[list[int]] = []
+    component_by_node: dict[int, int] = {}
+    seen: set[int] = set()
+    for node in sorted(constrained_nodes):
+        if node in seen:
+            continue
+        stack = [node]
+        component: list[int] = []
+        seen.add(node)
+        while stack:
+            current = stack.pop()
+            component.append(int(current))
+            for neighbor in must.get(current, set()):
+                neighbor = int(neighbor)
+                if neighbor in constrained_nodes and neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        component_id = len(components)
+        for member in component:
+            component_by_node[member] = component_id
+        components.append(sorted(component))
+    component_cannot: dict[int, set[int]] = {comp_id: set() for comp_id in range(len(components))}
+    for node in constrained_nodes:
+        left = component_by_node[int(node)]
+        for neighbor in cannot.get(int(node), set()):
+            neighbor = int(neighbor)
+            if neighbor not in constrained_nodes:
+                continue
+            right = component_by_node[neighbor]
+            if left == right:
+                continue
+            component_cannot[left].add(right)
+            component_cannot[right].add(left)
+    return components, component_cannot, constrained_nodes
+
+
 def _init_centers(x_train: np.ndarray, n_clusters: int, rng: np.random.Generator) -> np.ndarray:
     seeds = rng.choice(len(x_train), size=n_clusters, replace=False)
     return x_train[seeds].copy()
@@ -49,14 +100,48 @@ def _assign_points(
     centers: np.ndarray,
     must: dict[int, set[int]],
     cannot: dict[int, set[int]],
+    components: list[list[int]],
+    component_cannot: dict[int, set[int]],
+    constrained_nodes: set[int],
     rng: np.random.Generator,
 ) -> tuple[np.ndarray | None, bool]:
-    order = np.arange(len(x_train))
-    rng.shuffle(order)
+    index_to_local = {int(idx): int(pos) for pos, idx in enumerate(train_indices)}
     assignments: dict[int, int] = {}
     cluster_assignments = np.full(len(x_train), fill_value=-1, dtype=np.int64)
+    weighted_components = [
+        (
+            -len(component_cannot.get(comp_id, set())),
+            -len(members),
+            float(rng.random()),
+            comp_id,
+        )
+        for comp_id, members in enumerate(components)
+    ]
+    for _, _, _, comp_id in sorted(weighted_components):
+        members = components[comp_id]
+        local_members = [index_to_local[int(member)] for member in members]
+        centroid = x_train[np.asarray(local_members, dtype=np.int64)].mean(axis=0, keepdims=True)
+        distances = ((centers - centroid) ** 2).sum(axis=1)
+        blocked = {
+            int(assignments[int(neighbor)])
+            for member in members
+            for neighbor in cannot.get(int(member), set())
+            if int(neighbor) in assignments
+        }
+        candidate_clusters = [int(cluster_id) for cluster_id in np.argsort(distances) if int(cluster_id) not in blocked]
+        if not candidate_clusters:
+            return None, False
+        chosen_cluster = int(candidate_clusters[0])
+        for member in members:
+            assignments[int(member)] = chosen_cluster
+            cluster_assignments[index_to_local[int(member)]] = chosen_cluster
+
+    order = np.arange(len(x_train))
+    rng.shuffle(order)
     for local_idx in order:
         global_idx = int(train_indices[local_idx])
+        if global_idx in constrained_nodes:
+            continue
         distances = ((centers - x_train[local_idx : local_idx + 1]) ** 2).sum(axis=1)
         candidate_clusters = np.argsort(distances)
         assigned = False
@@ -119,7 +204,13 @@ def run_cop_kmeans(
     x_test = test["x_flat"]
     cfg = config["cop_kmeans"]
     must, cannot = _build_constraint_maps(dataset.pairwise_constraints)
+    components, component_cannot, constrained_nodes = _build_constraint_components(train["indices"], must, cannot)
     logger.log("backend=cpu algorithm=constraint_kmeans")
+    logger.log_metrics(
+        "cop_kmeans_constraints",
+        constrained_nodes=len(constrained_nodes),
+        must_components=len(components),
+    )
     candidates = []
     rng_master = np.random.default_rng(config["protocol"]["split_seed"])
     for init_id in range(cfg["n_init"]):
@@ -128,7 +219,17 @@ def run_cop_kmeans(
         feasible = True
         assignments = None
         for _ in range(cfg["max_iter"]):
-            assignments_new, feasible = _assign_points(x_train, train["indices"], centers, must, cannot, rng)
+            assignments_new, feasible = _assign_points(
+                x_train,
+                train["indices"],
+                centers,
+                must,
+                cannot,
+                components,
+                component_cannot,
+                constrained_nodes,
+                rng,
+            )
             if not feasible or assignments_new is None:
                 break
             new_centers = _recompute_centers(x_train, assignments_new, cfg["n_clusters"], rng)
@@ -196,6 +297,8 @@ def run_cop_kmeans(
         },
         "constraint_satisfaction": _constraint_satisfaction(train["indices"], train_assignments, dataset.pairwise_constraints),
         "infeasible_restarts": int(len([candidate for candidate in candidates if not candidate.get("feasible")])),
+        "constraint_components": int(len(components)),
+        "constrained_nodes": int(len(constrained_nodes)),
     }
     write_experiment_payload(
         exp_path,

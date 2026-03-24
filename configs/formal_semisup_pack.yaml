@@ -36,7 +36,7 @@ performance:
   pin_memory: true
   non_blocking_transfer: true
   mixed_precision: true
-  amp_dtype: bfloat16
+  amp_dtype: float16
   allow_tf32: true
   torch_compile: false
   compile_mode: max-autotune

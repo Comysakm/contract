@@ -49,9 +49,12 @@ def _make_scaler(device: str, performance_cfg: dict[str, Any]):
     torch, _ = _torch()
     enabled = bool(performance_cfg.get("mixed_precision", True)) and str(device).startswith("cuda")
     try:
-        return torch.cuda.amp.GradScaler(enabled=enabled)
+        return torch.amp.GradScaler("cuda", enabled=enabled)
     except Exception:
-        return None
+        try:
+            return torch.cuda.amp.GradScaler(enabled=enabled)
+        except Exception:
+            return None
 
 
 def _maybe_compile(model, device: str, performance_cfg: dict[str, Any]):
@@ -178,8 +181,8 @@ def _evaluate_classifier(model, batch_stream, device: str, num_classes: int, per
             batch = _to_device(batch, device, performance_cfg)
             with _autocast_context(device, performance_cfg):
                 logits, embeddings = model(batch["x_seq"], batch["mask"])
-            all_logits.append(logits.detach().cpu().numpy())
-            all_embeddings.append(embeddings.detach().cpu().numpy())
+            all_logits.append(logits.detach().float().cpu().numpy())
+            all_embeddings.append(embeddings.detach().float().cpu().numpy())
             all_targets.append(batch["y"].detach().cpu().numpy())
     logits_np = np.concatenate(all_logits, axis=0)
     embeddings_np = np.concatenate(all_embeddings, axis=0)

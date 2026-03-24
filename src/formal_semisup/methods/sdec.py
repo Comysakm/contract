@@ -91,7 +91,7 @@ def _evaluate_sdec(model, x: np.ndarray, y: np.ndarray, device: str, num_classes
             z = model.encode(x_tensor)
             q = model.soft_assign(z)
         assignments = torch.argmax(q, dim=1).cpu().numpy().astype(np.int64)
-        embeddings = z.cpu().numpy().astype(np.float32)
+        embeddings = z.float().cpu().numpy().astype(np.float32)
     return clustering_with_semantic_mapping(y, assignments, num_classes=num_classes, features=embeddings), embeddings, assignments
 
 
@@ -106,9 +106,12 @@ def _make_scaler(device: str, performance_cfg: dict[str, Any]):
     torch, _, _ = _torch()
     enabled = bool(performance_cfg.get("mixed_precision", True)) and str(device).startswith("cuda")
     try:
-        return torch.cuda.amp.GradScaler(enabled=enabled)
+        return torch.amp.GradScaler("cuda", enabled=enabled)
     except Exception:
-        return None
+        try:
+            return torch.cuda.amp.GradScaler(enabled=enabled)
+        except Exception:
+            return None
 
 
 def _maybe_compile(model, device: str, performance_cfg: dict[str, Any]):
@@ -228,7 +231,7 @@ def run_sdec(
         state = torch.load(best_pretrain_path, map_location=device)
         model.load_state_dict(state["model_state"], strict=False)
     with torch.no_grad():
-        z_train = model.encode(torch.as_tensor(x_train, dtype=torch.float32, device=device)).cpu().numpy()
+        z_train = model.encode(torch.as_tensor(x_train, dtype=torch.float32, device=device)).float().cpu().numpy()
     kmeans = KMeans(n_clusters=cfg["n_clusters"], n_init=20, random_state=config["protocol"]["split_seed"])
     kmeans.fit(z_train)
     logger.log("sdec_init_kmeans completed")
