@@ -4,6 +4,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from sklearn.manifold import TSNE
 
 
@@ -32,7 +33,10 @@ def save_embedding_plots(output_dir: str | Path, embeddings: np.ndarray, labels:
     tsne_proj = TSNE(n_components=2, random_state=42, init="pca", learning_rate="auto").fit_transform(embeddings)
     umap_path = output_path / "umap.png"
     tsne_path = output_path / "tsne.png"
+    umap_csv = output_path / "umap_coords.csv"
+    tsne_csv = output_path / "tsne_coords.csv"
     _scatter(umap_path, umap_proj, labels, "UMAP")
     _scatter(tsne_path, tsne_proj, labels, "t-SNE")
-    return {"umap": str(umap_path), "tsne": str(tsne_path)}
-
+    pd.DataFrame({"x": umap_proj[:, 0], "y": umap_proj[:, 1], "label": labels}).to_csv(umap_csv, index=False)
+    pd.DataFrame({"x": tsne_proj[:, 0], "y": tsne_proj[:, 1], "label": labels}).to_csv(tsne_csv, index=False)
+    return {"umap": str(umap_path), "tsne": str(tsne_path), "umap_csv": str(umap_csv), "tsne_csv": str(tsne_csv)}

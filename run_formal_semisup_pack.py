@@ -83,8 +83,10 @@ def main() -> None:
         exp_dir = pack_root / variant
         if args.reuse_existing and experiment_complete(exp_dir):
             completed.append(variant)
+            print(f"[pack] skip completed variant={variant}", flush=True)
             continue
         ensure_dir(exp_dir)
+        print(f"[pack] start variant={variant} device={device}", flush=True)
         write_status(
             exp_dir,
             state="running",
@@ -117,6 +119,7 @@ def main() -> None:
                 },
             )
             completed.append(variant)
+            print(f"[pack] completed variant={variant}", flush=True)
         except Exception as exc:
             write_status(
                 exp_dir,
@@ -130,6 +133,7 @@ def main() -> None:
                 failure_reason=str(exc),
             )
             failed.append({"variant": variant, "error": str(exc)})
+            print(f"[pack] failed variant={variant} error={exc}", flush=True)
     manifest = {
         "pack_id": pack_id,
         "server_name": server_name,

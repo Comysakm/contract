@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from formal_semisup.reporting.paper_artifacts import export_paper_artifacts
 from formal_semisup.utils.io import ensure_dir, save_json
 
 
@@ -53,6 +54,7 @@ def write_experiment_payload(
     save_json(exp_path / "train_summary.json", train_summary)
     save_json(exp_path / "eval_summary.json", eval_summary)
     save_json(logs_path / "payload_snapshot.json", {"resolved_config": resolved_config, "train_summary": train_summary, "eval_summary": eval_summary})
+    export_paper_artifacts(exp_path, train_summary, eval_summary)
 
 
 def save_numpy_predictions(path: str | Path, values: np.ndarray) -> None:

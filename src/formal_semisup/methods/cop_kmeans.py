@@ -9,6 +9,7 @@ import numpy as np
 from formal_semisup.data.dataset import CanonicalDataset
 from formal_semisup.evaluation.metrics import clustering_with_semantic_mapping
 from formal_semisup.methods.common import copy_canonical_artifacts, select_best_candidate, write_experiment_payload
+from formal_semisup.utils.experiment_logger import get_experiment_logger
 from formal_semisup.utils.io import ensure_dir, save_json
 from formal_semisup.utils.repro import set_global_seed
 
@@ -108,6 +109,7 @@ def run_cop_kmeans(
     exp_path = Path(exp_dir)
     ensure_dir(exp_path / "checkpoints")
     ensure_dir(exp_path / "logs")
+    logger = get_experiment_logger(exp_path, "cop_kmeans")
     copy_canonical_artifacts(exp_path.parent / "canonical", exp_path)
     train = dataset.split_arrays("train")
     val = dataset.split_arrays("val")
@@ -117,6 +119,7 @@ def run_cop_kmeans(
     x_test = test["x_flat"]
     cfg = config["cop_kmeans"]
     must, cannot = _build_constraint_maps(dataset.pairwise_constraints)
+    logger.log("backend=cpu algorithm=constraint_kmeans")
     candidates = []
     rng_master = np.random.default_rng(config["protocol"]["split_seed"])
     for init_id in range(cfg["n_init"]):
@@ -137,6 +140,7 @@ def run_cop_kmeans(
             centers = new_centers
         if not feasible or assignments is None:
             candidates.append({"init_id": init_id, "feasible": False, "val_mapped_MA": -1.0, "val_NMI": -1.0, "val_ARI": -1.0})
+            logger.log_metrics("cop_kmeans_init", init_id=init_id, feasible=False)
             continue
         val_assignments = _nearest_assign(x_val, centers)
         val_eval = clustering_with_semantic_mapping(val["y"], val_assignments, num_classes=config["data"]["num_classes"], features=x_val)
@@ -151,6 +155,14 @@ def run_cop_kmeans(
                 "train_assignments": assignments,
                 "val_eval": val_eval,
             }
+        )
+        logger.log_metrics(
+            "cop_kmeans_init",
+            init_id=init_id,
+            feasible=True,
+            val_mapped_MA=float(val_eval["mapped_semantic_metrics"]["MA"]),
+            val_NMI=float(val_eval["clustering_metrics"]["NMI"]),
+            val_ARI=float(val_eval["clustering_metrics"]["ARI"]),
         )
     feasible_candidates = [candidate for candidate in candidates if candidate.get("feasible")]
     if not feasible_candidates:
@@ -190,5 +202,10 @@ def run_cop_kmeans(
         resolved_config={"variant": "cop_kmeans", "cop_kmeans": cfg, "protocol": config["protocol"], "data": config["data"]},
         train_summary=train_summary,
         eval_summary=eval_summary,
+    )
+    logger.log(
+        f"completed test_mapped_OA={test_eval['mapped_semantic_metrics']['OA']:.6f} "
+        f"test_mapped_MA={test_eval['mapped_semantic_metrics']['MA']:.6f} "
+        f"test_NMI={test_eval['clustering_metrics']['NMI']:.6f}"
     )
     return eval_summary

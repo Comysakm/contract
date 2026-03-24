@@ -12,6 +12,7 @@ from sklearn.manifold import spectral_embedding
 from formal_semisup.data.dataset import CanonicalDataset
 from formal_semisup.evaluation.metrics import clustering_with_semantic_mapping
 from formal_semisup.methods.common import copy_canonical_artifacts, select_best_candidate, write_experiment_payload
+from formal_semisup.utils.experiment_logger import get_experiment_logger
 from formal_semisup.utils.faiss_utils import NeighborSearchIndex, build_neighbor_index
 from formal_semisup.utils.io import ensure_dir, save_json
 from formal_semisup.utils.repro import set_global_seed
@@ -213,6 +214,7 @@ def run_semi_supervised_spectral(
     exp_path = Path(exp_dir)
     ensure_dir(exp_path / "checkpoints")
     ensure_dir(exp_path / "logs")
+    logger = get_experiment_logger(exp_path, "semi_supervised_spectral")
     copy_canonical_artifacts(exp_path.parent / "canonical", exp_path)
     train = dataset.split_arrays("train")
     val = dataset.split_arrays("val")
@@ -231,8 +233,10 @@ def run_semi_supervised_spectral(
         },
     )
     _write_stage_progress(exp_path, "started", device=device)
+    logger.log(f"started device={device} performance={performance_cfg}")
     affinity, sigma, neighbor_index, neighbor_summary = _build_knn_affinity(train["x_flat"], cfg["k_neighbors"], performance_cfg)
     _write_stage_progress(exp_path, "knn_affinity_built", sigma=sigma, neighbor_backend=neighbor_summary)
+    logger.log_metrics("spectral_stage", stage_name="knn_affinity_built", sigma=sigma, neighbor_backend=neighbor_summary["backend"])
     affinity, inject_summary = _inject_constraints(affinity, train["indices"], dataset.pairwise_constraints)
     graph_components, _ = connected_components(affinity)
     save_json(
@@ -249,6 +253,7 @@ def run_semi_supervised_spectral(
         },
     )
     _write_stage_progress(exp_path, "constraints_injected", connected_components=int(graph_components), edges=int(affinity.nnz))
+    logger.log_metrics("spectral_stage", stage_name="constraints_injected", connected_components=int(graph_components), edges=int(affinity.nnz))
     spectral_backend = _resolve_backend(device, performance_cfg)
     if spectral_backend == "gpu":
         train_embedding = _gpu_spectral_embedding(
@@ -290,6 +295,14 @@ def run_semi_supervised_spectral(
         clustering_backend=clustering_backend,
         embedding_shape=list(train_embedding.shape),
     )
+    logger.log_metrics(
+        "spectral_stage",
+        stage_name="spectral_embedding_ready",
+        spectral_backend=spectral_backend,
+        clustering_backend=clustering_backend,
+        embedding_rows=int(train_embedding.shape[0]),
+        embedding_dim=int(train_embedding.shape[1]),
+    )
 
     candidates = []
     for candidate in kmeans_candidates:
@@ -319,8 +332,16 @@ def run_semi_supervised_spectral(
                 "val_ARI": float(val_eval["clustering_metrics"]["ARI"]),
             },
         )
+        logger.log_metrics(
+            "spectral_candidate",
+            init_id=int(candidate["init_id"]),
+            val_mapped_MA=float(val_eval["mapped_semantic_metrics"]["MA"]),
+            val_NMI=float(val_eval["clustering_metrics"]["NMI"]),
+            val_ARI=float(val_eval["clustering_metrics"]["ARI"]),
+        )
     best = select_best_candidate(candidates, "val_mapped_MA", ["val_NMI", "val_ARI"])
     _write_stage_progress(exp_path, "best_candidate_selected", best_init_id=int(best["init_id"]))
+    logger.log_metrics("spectral_stage", stage_name="best_candidate_selected", best_init_id=int(best["init_id"]))
     centers = best["centers"]
     train_assignments = best["train_assignments"]
     val_embedding = best["val_embedding"]
@@ -381,4 +402,9 @@ def run_semi_supervised_spectral(
         eval_summary=eval_summary,
     )
     _write_stage_progress(exp_path, "completed")
+    logger.log(
+        f"completed test_mapped_OA={test_eval['mapped_semantic_metrics']['OA']:.6f} "
+        f"test_mapped_MA={test_eval['mapped_semantic_metrics']['MA']:.6f} "
+        f"test_NMI={test_eval['clustering_metrics']['NMI']:.6f}"
+    )
     return eval_summary

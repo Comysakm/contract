@@ -58,6 +58,10 @@ class PackSmokeTests(unittest.TestCase):
             summary = pd.read_csv(pack_root / "summary.csv")
             self.assertIn("variant", summary.columns)
             self.assertTrue({"cop_kmeans", "semi_supervised_spectral"}.issubset(set(summary["variant"].unique())))
+            self.assertTrue((pack_root / "cop_kmeans" / "logs" / "terminal.log").exists())
+            self.assertTrue((pack_root / "semi_supervised_spectral" / "logs" / "terminal.log").exists())
+            self.assertTrue((pack_root / "cop_kmeans" / "tables" / "split_metrics.csv").exists())
+            self.assertTrue((pack_root / "semi_supervised_spectral" / "tables" / "split_metrics.csv").exists())
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

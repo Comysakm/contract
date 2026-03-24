@@ -9,6 +9,7 @@ from formal_semisup.data.dataset import CanonicalDataset
 from formal_semisup.evaluation.metrics import classification_metrics
 from formal_semisup.methods.common import copy_canonical_artifacts, write_experiment_payload
 from formal_semisup.reporting.visualization import save_embedding_plots
+from formal_semisup.utils.experiment_logger import get_experiment_logger
 from formal_semisup.utils.io import ensure_dir, save_json
 from formal_semisup.utils.performance import make_tensor_batch_stream, resolve_amp_dtype, setup_torch_performance
 from formal_semisup.utils.repro import set_global_seed
@@ -201,6 +202,8 @@ def _run_training_loop(
     variant: str,
     num_classes: int,
     performance_cfg: dict[str, Any],
+    logger,
+    stage_name: str,
 ) -> dict[str, Any]:
     torch, nn = _torch()
     criterion = nn.CrossEntropyLoss()
@@ -246,6 +249,15 @@ def _run_training_loop(
             "val_MA": float(val_metrics["MA"]),
         }
         history.append(epoch_record)
+        logger.log_metrics(
+            stage_name,
+            epoch=f"{epoch + 1}/{max_epochs}",
+            train_loss=epoch_record["train_loss"],
+            val_OA=epoch_record["val_OA"],
+            val_MA=epoch_record["val_MA"],
+            best_OA=max(best_metric, float(val_metrics["OA"])),
+            wait=epochs_without_improvement,
+        )
         improved = val_metrics["OA"] > best_metric
         if improved:
             best_metric = float(val_metrics["OA"])
@@ -336,6 +348,7 @@ def run_supervised_experiment(
     setup_torch_performance(device, performance_cfg)
     exp_path = Path(exp_dir)
     _copy_protocol(exp_path, exp_path.parent / "canonical")
+    logger = get_experiment_logger(exp_path, variant)
     supervised_cfg = config["supervised"]
     x_train = dataset.split_arrays("train")
     x_val = dataset.split_arrays("val")
@@ -356,6 +369,8 @@ def run_supervised_experiment(
         "val": val_stream_info,
         "test": test_stream_info,
     }
+    logger.log(f"device={device} performance={performance_cfg}")
+    logger.log(f"data_stream={stream_info}")
     if variant in {"supervised_lstm", "supervised_rnn", "supervised_gru"}:
         wrapper = RecurrentClassifier(
             variant,
@@ -379,6 +394,8 @@ def run_supervised_experiment(
             variant=variant,
             num_classes=config["data"]["num_classes"],
             performance_cfg=performance_cfg,
+            logger=logger,
+            stage_name="train",
         )
         train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(model, train_eval_stream, device, config["data"]["num_classes"], performance_cfg)
         val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(model, val_stream, device, config["data"]["num_classes"], performance_cfg)
@@ -407,6 +424,8 @@ def run_supervised_experiment(
             variant=variant,
             num_classes=config["data"]["num_classes"],
             performance_cfg=performance_cfg,
+            logger=logger,
+            stage_name="train",
         )
         train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(model, train_eval_stream, device, config["data"]["num_classes"], performance_cfg)
         val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(model, val_stream, device, config["data"]["num_classes"], performance_cfg)
@@ -468,6 +487,13 @@ def run_supervised_experiment(
                         val_losses.append(float(reconstruction_mse(recon, batch["x_seq"], batch["mask"]).item()))
             val_recon = float(np.mean(val_losses)) if val_losses else float("inf")
             pretrain_history.append({"epoch": epoch, "train_recon_loss": float(np.mean(losses)), "val_reconstruction_loss": val_recon})
+            logger.log_metrics(
+                "cae_pretrain",
+                epoch=f"{epoch + 1}/{cae_cfg['pretrain_epochs']}",
+                train_recon_loss=float(np.mean(losses)) if losses else None,
+                val_reconstruction_loss=val_recon,
+                best_val_reconstruction_loss=min(best_recon, val_recon),
+            )
             if val_recon < best_recon:
                 best_recon = val_recon
                 best_recon_epoch = epoch
@@ -511,6 +537,8 @@ def run_supervised_experiment(
             variant=variant,
             num_classes=config["data"]["num_classes"],
             performance_cfg=performance_cfg,
+            logger=logger,
+            stage_name="cae_finetune",
         )
         train_metrics, _, train_embeddings, train_preds = _evaluate_classifier(classifier_model, train_eval_stream, device, config["data"]["num_classes"], performance_cfg)
         val_metrics, _, val_embeddings, val_preds = _evaluate_classifier(classifier_model, val_stream, device, config["data"]["num_classes"], performance_cfg)
@@ -549,4 +577,5 @@ def run_supervised_experiment(
         eval_summary=eval_summary,
     )
     save_json(exp_path / "predictions_summary.json", {"train": train_preds.tolist(), "val": val_preds.tolist(), "test": test_preds.tolist()})
+    logger.log(f"completed test_OA={test_metrics['OA']:.6f} test_MA={test_metrics['MA']:.6f}")
     return eval_summary

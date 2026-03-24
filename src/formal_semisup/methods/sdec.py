@@ -10,6 +10,7 @@ from formal_semisup.data.dataset import CanonicalDataset
 from formal_semisup.evaluation.metrics import clustering_with_semantic_mapping
 from formal_semisup.methods.common import copy_canonical_artifacts, write_experiment_payload
 from formal_semisup.reporting.visualization import save_embedding_plots
+from formal_semisup.utils.experiment_logger import get_experiment_logger
 from formal_semisup.utils.io import ensure_dir, save_json
 from formal_semisup.utils.performance import make_flat_tensor_batch_stream, resolve_amp_dtype, setup_torch_performance
 from formal_semisup.utils.repro import set_global_seed
@@ -134,6 +135,7 @@ def run_sdec(
     exp_path = Path(exp_dir)
     ensure_dir(exp_path / "checkpoints")
     ensure_dir(exp_path / "logs")
+    logger = get_experiment_logger(exp_path, "sdec")
     copy_canonical_artifacts(exp_path.parent / "canonical", exp_path)
     train = dataset.split_arrays("train")
     val = dataset.split_arrays("val")
@@ -151,6 +153,8 @@ def run_sdec(
         device=device,
         performance_cfg=performance_cfg,
     )
+    logger.log(f"device={device} performance={performance_cfg}")
+    logger.log(f"stage1_data_stream={train_stream_info}")
     val_tensor = torch.as_tensor(x_val, dtype=torch.float32, device=device)
     pretrain_optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     pretrain_scaler = _make_scaler(device, performance_cfg)
@@ -198,6 +202,13 @@ def run_sdec(
             with _autocast_context(device, performance_cfg):
                 val_recon = float(F.mse_loss(model.reconstruct(val_tensor), val_tensor).item())
         pretrain_history.append({"epoch": epoch, "train_reconstruction_loss": float(np.mean(losses)), "val_reconstruction_loss": val_recon})
+        logger.log_metrics(
+            "sdec_pretrain",
+            epoch=f"{epoch + 1}/{cfg['pretrain_epochs']}",
+            train_reconstruction_loss=float(np.mean(losses)) if losses else None,
+            val_reconstruction_loss=val_recon,
+            best_val_reconstruction_loss=min(best_pretrain, val_recon),
+        )
         if val_recon < best_pretrain:
             best_pretrain = val_recon
             best_pretrain_epoch = epoch
@@ -220,6 +231,7 @@ def run_sdec(
         z_train = model.encode(torch.as_tensor(x_train, dtype=torch.float32, device=device)).cpu().numpy()
     kmeans = KMeans(n_clusters=cfg["n_clusters"], n_init=20, random_state=config["protocol"]["split_seed"])
     kmeans.fit(z_train)
+    logger.log("sdec_init_kmeans completed")
     centers = torch.as_tensor(kmeans.cluster_centers_, dtype=torch.float32, device=device)
     model.cluster_centers = nn.Parameter(centers)
     train_index_to_local = {int(idx): int(pos) for pos, idx in enumerate(train["indices"])}
@@ -294,6 +306,18 @@ def run_sdec(
             "val_ARI": float(val_eval["clustering_metrics"]["ARI"]),
         }
         history.append(record)
+        logger.log_metrics(
+            "sdec_train",
+            epoch=f"{epoch + 1}/{cfg['train_epochs']}",
+            train_loss=record["train_loss"],
+            train_kl_loss=record["train_kl_loss"],
+            train_pairwise_loss=record["train_pairwise_loss"],
+            val_mapped_MA=record["val_mapped_MA"],
+            val_NMI=record["val_NMI"],
+            val_ARI=record["val_ARI"],
+            best_val_mapped_MA=max(best_score[0], record["val_mapped_MA"]),
+            wait=wait,
+        )
         score = (record["val_mapped_MA"], record["val_NMI"], record["val_ARI"])
         if score > best_score:
             best_metric = record["val_mapped_MA"]
@@ -367,5 +391,10 @@ def run_sdec(
         resolved_config={"variant": "sdec", "sdec": cfg, "protocol": config["protocol"], "data": config["data"], "performance": performance_cfg},
         train_summary=train_summary,
         eval_summary=eval_summary,
+    )
+    logger.log(
+        f"completed test_mapped_OA={test_eval['mapped_semantic_metrics']['OA']:.6f} "
+        f"test_mapped_MA={test_eval['mapped_semantic_metrics']['MA']:.6f} "
+        f"test_NMI={test_eval['clustering_metrics']['NMI']:.6f}"
     )
     return eval_summary
