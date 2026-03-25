@@ -28,7 +28,7 @@ def _torch():
 
 class StackedAutoencoder:
     def __init__(self, input_dim: int, hidden_dims: list[int], latent_dim: int):
-        torch, nn, _, _, _ = _torch()
+        torch, nn, _ = _torch()
         encoder_layers = []
         prev = input_dim
         for dim in hidden_dims:
