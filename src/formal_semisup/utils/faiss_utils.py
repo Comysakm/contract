@@ -25,11 +25,13 @@ def _torch_cuda_available() -> bool:
         return False
 
 
-def _want_faiss_gpu(performance_cfg: dict[str, Any]) -> bool:
+def _want_faiss_gpu(performance_cfg: dict[str, Any], device: str | None = None) -> bool:
     mode = str(performance_cfg.get("faiss_use_gpu", "auto")).lower()
     if mode == "true" or mode == "always":
-        return True
+        return device is None or str(device).startswith("cuda")
     if mode == "false" or mode == "never":
+        return False
+    if device is not None and not str(device).startswith("cuda"):
         return False
     return _torch_cuda_available()
 
@@ -85,14 +87,20 @@ class NeighborSearchIndex:
         }
 
 
-def build_neighbor_index(x_train: np.ndarray, n_neighbors: int, performance_cfg: dict[str, Any]) -> NeighborSearchIndex:
+def build_neighbor_index(
+    x_train: np.ndarray,
+    n_neighbors: int,
+    performance_cfg: dict[str, Any],
+    *,
+    device: str | None = None,
+) -> NeighborSearchIndex:
     x_train = np.ascontiguousarray(x_train.astype(np.float32))
     prefer_faiss = bool(performance_cfg.get("prefer_faiss", True))
     faiss = _try_import_faiss() if prefer_faiss else None
     query_chunk = int(performance_cfg.get("faiss_query_chunk", 0) or 0)
     allow_gpu_fallback = bool(performance_cfg.get("faiss_gpu_fallback_to_cpu", True))
     if faiss is not None:
-        use_gpu = _want_faiss_gpu(performance_cfg) and hasattr(faiss, "StandardGpuResources")
+        use_gpu = _want_faiss_gpu(performance_cfg, device=device) and hasattr(faiss, "StandardGpuResources")
         try:
             if use_gpu:
                 res = faiss.StandardGpuResources()

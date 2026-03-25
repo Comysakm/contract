@@ -101,7 +101,7 @@ def main() -> None:
             if variant in {"supervised_lstm", "supervised_rnn", "supervised_gru", "supervised_transformer", "cae_pretrain_classifier"}:
                 run_supervised_experiment(variant=variant, dataset=dataset, config=config, exp_dir=exp_dir, device=device)
             elif variant == "cop_kmeans":
-                run_cop_kmeans(dataset=dataset, config=config, exp_dir=exp_dir)
+                run_cop_kmeans(dataset=dataset, config=config, exp_dir=exp_dir, device=device)
             elif variant == "semi_supervised_spectral":
                 run_semi_supervised_spectral(dataset=dataset, config=config, exp_dir=exp_dir, device=device)
             elif variant == "sdec":

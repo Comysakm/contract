@@ -10,6 +10,7 @@ from formal_semisup.data.dataset import CanonicalDataset
 from formal_semisup.evaluation.metrics import clustering_with_semantic_mapping
 from formal_semisup.methods.common import copy_canonical_artifacts, select_best_candidate, write_experiment_payload
 from formal_semisup.utils.experiment_logger import get_experiment_logger
+from formal_semisup.utils.faiss_utils import build_neighbor_index
 from formal_semisup.utils.io import ensure_dir, save_json
 from formal_semisup.utils.repro import set_global_seed
 
@@ -94,17 +95,44 @@ def _feasible(cluster_id: int, sample_idx: int, assignments: dict[int, int], mus
     return True
 
 
+def _nearest_assign_batched(
+    x: np.ndarray,
+    centers: np.ndarray,
+    performance_cfg: dict[str, Any],
+    device: str,
+    batch_size: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if len(x) == 0:
+        return np.empty((0,), dtype=np.int64), {"backend": "empty", "batch_size": int(batch_size)}
+    neighbor_index = build_neighbor_index(centers, 1, performance_cfg, device=device)
+    if neighbor_index.backend.startswith("faiss"):
+        _, neighbors = neighbor_index.kneighbors(x)
+        return neighbors[:, 0].astype(np.int64), neighbor_index.summary()
+    centers32 = centers.astype(np.float32, copy=False)
+    center_norm = (centers32**2).sum(axis=1, keepdims=True).T
+    assignments = np.empty(len(x), dtype=np.int64)
+    step = max(1, int(batch_size))
+    for start in range(0, len(x), step):
+        block = x[start : start + step].astype(np.float32, copy=False)
+        block_norm = (block**2).sum(axis=1, keepdims=True)
+        distances = block_norm - 2.0 * (block @ centers32.T) + center_norm
+        assignments[start : start + len(block)] = np.argmin(distances, axis=1).astype(np.int64)
+    return assignments, {"backend": "numpy-batched", "batch_size": int(step), "n_centers": int(len(centers))}
+
+
 def _assign_points(
     x_train: np.ndarray,
     train_indices: np.ndarray,
+    unconstrained_locals: np.ndarray,
     centers: np.ndarray,
     must: dict[int, set[int]],
     cannot: dict[int, set[int]],
     components: list[list[int]],
     component_cannot: dict[int, set[int]],
-    constrained_nodes: set[int],
-    rng: np.random.Generator,
-) -> tuple[np.ndarray | None, bool]:
+    performance_cfg: dict[str, Any],
+    device: str,
+    assignment_chunk: int,
+) -> tuple[np.ndarray | None, bool, dict[str, Any] | None]:
     index_to_local = {int(idx): int(pos) for pos, idx in enumerate(train_indices)}
     assignments: dict[int, int] = {}
     cluster_assignments = np.full(len(x_train), fill_value=-1, dtype=np.int64)
@@ -112,12 +140,11 @@ def _assign_points(
         (
             -len(component_cannot.get(comp_id, set())),
             -len(members),
-            float(rng.random()),
             comp_id,
         )
         for comp_id, members in enumerate(components)
     ]
-    for _, _, _, comp_id in sorted(weighted_components):
+    for _, _, comp_id in sorted(weighted_components):
         members = components[comp_id]
         local_members = [index_to_local[int(member)] for member in members]
         centroid = x_train[np.asarray(local_members, dtype=np.int64)].mean(axis=0, keepdims=True)
@@ -130,30 +157,25 @@ def _assign_points(
         }
         candidate_clusters = [int(cluster_id) for cluster_id in np.argsort(distances) if int(cluster_id) not in blocked]
         if not candidate_clusters:
-            return None, False
+            return None, False, None
         chosen_cluster = int(candidate_clusters[0])
         for member in members:
             assignments[int(member)] = chosen_cluster
             cluster_assignments[index_to_local[int(member)]] = chosen_cluster
 
-    order = np.arange(len(x_train))
-    rng.shuffle(order)
-    for local_idx in order:
-        global_idx = int(train_indices[local_idx])
-        if global_idx in constrained_nodes:
-            continue
-        distances = ((centers - x_train[local_idx : local_idx + 1]) ** 2).sum(axis=1)
-        candidate_clusters = np.argsort(distances)
-        assigned = False
-        for cluster_id in candidate_clusters:
-            if _feasible(int(cluster_id), global_idx, assignments, must, cannot):
-                assignments[global_idx] = int(cluster_id)
-                cluster_assignments[local_idx] = int(cluster_id)
-                assigned = True
-                break
-        if not assigned:
-            return None, False
-    return cluster_assignments, True
+    assignment_backend = None
+    if len(unconstrained_locals) > 0:
+        unconstrained_assignments, assignment_backend = _nearest_assign_batched(
+            x_train[unconstrained_locals],
+            centers,
+            performance_cfg,
+            device,
+            assignment_chunk,
+        )
+        cluster_assignments[unconstrained_locals] = unconstrained_assignments
+    if np.any(cluster_assignments < 0):
+        return None, False, assignment_backend
+    return cluster_assignments, True, assignment_backend
 
 
 def _recompute_centers(x_train: np.ndarray, assignments: np.ndarray, n_clusters: int, rng: np.random.Generator) -> np.ndarray:
@@ -165,11 +187,6 @@ def _recompute_centers(x_train: np.ndarray, assignments: np.ndarray, n_clusters:
         else:
             centers.append(members.mean(axis=0))
     return np.stack(centers, axis=0).astype(np.float32)
-
-
-def _nearest_assign(x: np.ndarray, centers: np.ndarray) -> np.ndarray:
-    distances = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-    return distances.argmin(axis=1).astype(np.int64)
 
 
 def _constraint_satisfaction(train_indices: np.ndarray, assignments: np.ndarray, pairwise_constraints: dict[str, Any]) -> dict[str, float]:
@@ -189,6 +206,7 @@ def run_cop_kmeans(
     dataset: CanonicalDataset,
     config: dict[str, Any],
     exp_dir: str | Path,
+    device: str = "cpu",
 ) -> dict[str, Any]:
     set_global_seed(config["protocol"]["split_seed"])
     exp_path = Path(exp_dir)
@@ -203,9 +221,13 @@ def run_cop_kmeans(
     x_val = val["x_flat"]
     x_test = test["x_flat"]
     cfg = config["cop_kmeans"]
+    performance_cfg = config.get("performance", {})
+    assignment_chunk = int(cfg.get("assignment_chunk", performance_cfg.get("faiss_query_chunk", 8192) or 8192))
     must, cannot = _build_constraint_maps(dataset.pairwise_constraints)
     components, component_cannot, constrained_nodes = _build_constraint_components(train["indices"], must, cannot)
-    logger.log("backend=cpu algorithm=constraint_kmeans")
+    constrained_mask = np.asarray([int(idx) in constrained_nodes for idx in train["indices"]], dtype=bool)
+    unconstrained_locals = np.flatnonzero(~constrained_mask).astype(np.int64, copy=False)
+    logger.log(f"backend=constraint_kmeans device={device}")
     logger.log_metrics(
         "cop_kmeans_constraints",
         constrained_nodes=len(constrained_nodes),
@@ -213,23 +235,28 @@ def run_cop_kmeans(
     )
     candidates = []
     rng_master = np.random.default_rng(config["protocol"]["split_seed"])
+    assignment_backend = None
     for init_id in range(cfg["n_init"]):
         rng = np.random.default_rng(int(rng_master.integers(0, 1_000_000)))
         centers = _init_centers(x_train, cfg["n_clusters"], rng)
         feasible = True
         assignments = None
         for _ in range(cfg["max_iter"]):
-            assignments_new, feasible = _assign_points(
+            assignments_new, feasible, current_backend = _assign_points(
                 x_train,
                 train["indices"],
+                unconstrained_locals,
                 centers,
                 must,
                 cannot,
                 components,
                 component_cannot,
-                constrained_nodes,
-                rng,
+                performance_cfg,
+                device,
+                assignment_chunk,
             )
+            if current_backend is not None:
+                assignment_backend = current_backend
             if not feasible or assignments_new is None:
                 break
             new_centers = _recompute_centers(x_train, assignments_new, cfg["n_clusters"], rng)
@@ -243,7 +270,7 @@ def run_cop_kmeans(
             candidates.append({"init_id": init_id, "feasible": False, "val_mapped_MA": -1.0, "val_NMI": -1.0, "val_ARI": -1.0})
             logger.log_metrics("cop_kmeans_init", init_id=init_id, feasible=False)
             continue
-        val_assignments = _nearest_assign(x_val, centers)
+        val_assignments, _ = _nearest_assign_batched(x_val, centers, performance_cfg, device, assignment_chunk)
         val_eval = clustering_with_semantic_mapping(val["y"], val_assignments, num_classes=config["data"]["num_classes"], features=x_val)
         candidates.append(
             {
@@ -271,8 +298,15 @@ def run_cop_kmeans(
     best = select_best_candidate(feasible_candidates, "val_mapped_MA", ["val_NMI", "val_ARI"])
     centers = best["centers"]
     train_assignments = best["train_assignments"]
-    val_assignments = _nearest_assign(x_val, centers)
-    test_assignments = _nearest_assign(x_test, centers)
+    val_assignments, val_backend = _nearest_assign_batched(x_val, centers, performance_cfg, device, assignment_chunk)
+    test_assignments, test_backend = _nearest_assign_batched(x_test, centers, performance_cfg, device, assignment_chunk)
+    backend_summary = assignment_backend or val_backend or test_backend
+    logger.log_metrics(
+        "cop_kmeans_backend",
+        backend=str((backend_summary or {}).get("backend", "unknown")),
+        device=device,
+        assignment_chunk=int(assignment_chunk),
+    )
     train_eval = clustering_with_semantic_mapping(train["y"], train_assignments, num_classes=config["data"]["num_classes"], features=x_train)
     val_eval = clustering_with_semantic_mapping(val["y"], val_assignments, num_classes=config["data"]["num_classes"], features=x_val)
     test_eval = clustering_with_semantic_mapping(test["y"], test_assignments, num_classes=config["data"]["num_classes"], features=x_test)
@@ -295,6 +329,8 @@ def run_cop_kmeans(
             "primary": "val_mapped_MA",
             "tie_break": ["val_NMI", "val_ARI"],
         },
+        "device": device,
+        "assignment_backend": backend_summary,
         "constraint_satisfaction": _constraint_satisfaction(train["indices"], train_assignments, dataset.pairwise_constraints),
         "infeasible_restarts": int(len([candidate for candidate in candidates if not candidate.get("feasible")])),
         "constraint_components": int(len(components)),
@@ -302,7 +338,14 @@ def run_cop_kmeans(
     }
     write_experiment_payload(
         exp_path,
-        resolved_config={"variant": "cop_kmeans", "cop_kmeans": cfg, "protocol": config["protocol"], "data": config["data"]},
+        resolved_config={
+            "variant": "cop_kmeans",
+            "cop_kmeans": cfg,
+            "protocol": config["protocol"],
+            "data": config["data"],
+            "performance": performance_cfg,
+            "device": device,
+        },
         train_summary=train_summary,
         eval_summary=eval_summary,
     )

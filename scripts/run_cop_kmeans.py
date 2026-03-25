@@ -19,10 +19,11 @@ def main() -> None:
     parser.add_argument("--config", default=str(ROOT / "configs" / "formal_semisup_pack.yaml"))
     parser.add_argument("--canonical-dir", required=True)
     parser.add_argument("--exp-dir", required=True)
+    parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
     config = load_config(args.config)
     dataset = load_canonical_dataset(args.canonical_dir)
-    run_cop_kmeans(dataset=dataset, config=config, exp_dir=args.exp_dir)
+    run_cop_kmeans(dataset=dataset, config=config, exp_dir=args.exp_dir, device=args.device)
 
 
 if __name__ == "__main__":

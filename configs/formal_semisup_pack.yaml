@@ -73,6 +73,7 @@ cop_kmeans:
   n_clusters: 16
   n_init: 10
   max_iter: 100
+  assignment_chunk: 8192
 
 semi_supervised_spectral:
   n_clusters: 16

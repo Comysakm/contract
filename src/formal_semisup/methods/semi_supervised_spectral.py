@@ -27,9 +27,14 @@ def _torch():
     return torch
 
 
-def _build_knn_affinity(x_train: np.ndarray, k_neighbors: int, performance_cfg: dict[str, Any]) -> tuple[sparse.csr_matrix, float, NeighborSearchIndex, dict[str, Any]]:
+def _build_knn_affinity(
+    x_train: np.ndarray,
+    k_neighbors: int,
+    performance_cfg: dict[str, Any],
+    device: str,
+) -> tuple[sparse.csr_matrix, float, NeighborSearchIndex, dict[str, Any]]:
     n_query_neighbors = min(k_neighbors + 1, len(x_train))
-    neighbor_index = build_neighbor_index(x_train, n_query_neighbors, performance_cfg)
+    neighbor_index = build_neighbor_index(x_train, n_query_neighbors, performance_cfg, device=device)
     distances, neighbors = neighbor_index.kneighbors(x_train)
     sigma = float(np.median(distances[:, 1:])) if distances.shape[1] > 1 else 1.0
     sigma = sigma if sigma > 1e-8 else 1.0
@@ -234,7 +239,12 @@ def run_semi_supervised_spectral(
     )
     _write_stage_progress(exp_path, "started", device=device)
     logger.log(f"started device={device} performance={performance_cfg}")
-    affinity, sigma, neighbor_index, neighbor_summary = _build_knn_affinity(train["x_flat"], cfg["k_neighbors"], performance_cfg)
+    affinity, sigma, neighbor_index, neighbor_summary = _build_knn_affinity(
+        train["x_flat"],
+        cfg["k_neighbors"],
+        performance_cfg,
+        device,
+    )
     _write_stage_progress(exp_path, "knn_affinity_built", sigma=sigma, neighbor_backend=neighbor_summary)
     logger.log_metrics("spectral_stage", stage_name="knn_affinity_built", sigma=sigma, neighbor_backend=neighbor_summary["backend"])
     affinity, inject_summary = _inject_constraints(affinity, train["indices"], dataset.pairwise_constraints)
